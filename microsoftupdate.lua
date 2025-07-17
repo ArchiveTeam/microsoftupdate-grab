@@ -288,13 +288,12 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
     while string.find(url_, "&amp;") do
       url_ = string.gsub(url_, "&amp;", "&")
     end
-    if not processed(url_)
-      and not processed(url_ .. "/")
+    if not processed(url_ .. tostring(post_data))
       and allowed(url_, origurl) then
       local headers = {}
       if string.match(url_, "/DownloadDialog%.aspx") then
         if not post_data then
-          error("Expected post data.")
+          return nil
         end
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         table.insert(urls, {
@@ -311,7 +310,7 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
           headers=headers
         })
       end
-      addedtolist[url_] = true
+      addedtolist[url_.. tostring(post_data)] = true
       addedtolist[url] = true
     end
   end
