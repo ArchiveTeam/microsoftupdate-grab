@@ -142,10 +142,7 @@ set_item = function(url)
       new_item_value = string.gsub(new_item_value, "%+", " ")
       new_item_value = urlparse.unescape(new_item_value)
       newcontext["search"] = new_item_value
-      local search_term, star_term = string.match(new_item_value, "^(.-)([0-9a-f]+)%*$")
-      if search_term == " " then
-        search_term = ""
-      end
+      local search_term, star_term = string.match(new_item_value, "^(.-) *([0-9a-f]+)%*$")
       newcontext["search_term"] = search_term
       newcontext["star_term"] = star_term
       if star_term then
