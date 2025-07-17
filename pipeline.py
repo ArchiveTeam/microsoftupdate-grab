@@ -79,7 +79,7 @@ if not WGET_AT:
 #
 # Update this each time you make a non-cosmetic change.
 # It will be added to the WARC files and reported to the tracker.
-VERSION = '20250717.02'
+VERSION = '20250717.03'
 USER_AGENT = 'Mozilla/5.0 (X11; Linux i686; rv:124.0) Gecko/20100101 Firefox/124.0'
 TRACKER_ID = 'microsoftupdate'
 TRACKER_HOST = 'legacy-api.arpa.li'
@@ -175,10 +175,10 @@ class CheckIntegrity(SimpleTask):
                     k, v = header.split(b': ', 1)
                     warc_headers[str(k, 'utf8')] = v
                 f.seek(start+len(warc_headers_raw)+4)
-                print('Checking {} {}... '.format(
+                item.log_output('Checking {} {}.'.format(
                     str(warc_headers['WARC-Type'], 'utf8'),
                     str(warc_headers['WARC-Record-ID'], 'utf8')
-                ), end='')
+                ))
                 d = b''
                 block_digest = hashlib.sha1()
                 has_payload = 'WARC-Payload-Digest' in warc_headers \
@@ -190,8 +190,6 @@ class CheckIntegrity(SimpleTask):
                 data = b''
                 content_length = int(warc_headers['Content-Length'])
                 for i in range(0, content_length, chunksize):
-                    if i > 0 and i % (chunksize*50) == 0:
-                        print('. ', end='')
                     d = f.read(min(chunksize, content_length-i))
                     if has_payload:
                         if payload_digest is None:
@@ -217,7 +215,6 @@ class CheckIntegrity(SimpleTask):
                     if payload_digest != warc_headers['WARC-Payload-Digest']:
                         raise Exception('Payload digests do not match. Got {}, expected {}.'
                                         .format(payload_digest, warc_headers['WARC-Payload-Digest']))
-                print(' done.')
                 f.seek(4, 1)
                 if len(f.read(1)) == 0:
                     break
