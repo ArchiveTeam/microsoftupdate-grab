@@ -1,6 +1,6 @@
 # microsoftupdate-grab
 
-More information about the archiving project can be found on the ArchiveTeam wiki: [Microsoft Update](https://wiki.archiveteam.org/index.php?title=Microsoft Update)
+More information about the archiving project can be found on the ArchiveTeam wiki: [Microsoft Update](https://wiki.archiveteam.org/index.php?title=Microsoft_Update)
 
 ## Setup instructions
 
