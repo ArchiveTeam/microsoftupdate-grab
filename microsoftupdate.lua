@@ -596,7 +596,8 @@ wget.callbacks.httploop_result = function(url, err, http_stat)
     io.stdout:flush()
     tries = tries + 1
     local maxtries = 11
-    if status_code == 401 or status_code == 403 then
+    if status_code == 401 or status_code == 403
+      or (status_code == 302 and string.match(url["url"], "/ScopedViewInline%.aspx%?updateid=")) then
       tries = maxtries + 1
     end
     if tries > maxtries then
