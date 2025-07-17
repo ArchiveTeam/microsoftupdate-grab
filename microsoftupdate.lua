@@ -727,7 +727,7 @@ wget.callbacks.finish = function(start_time, end_time, wall_time, numurls, total
   for key, data in pairs({
     ["microsoftupdate-0ht48j5nl9fbsyhs?skipbloom=1"] = discovered_items,
     ["microsoftupdate-binaries-r6n8hwu8ui3vx2lt?skipbloom=1"] = discovered_binaries,
-    ["microsoftupdate-updateids-?skipbloom=1"] = discovered_updateids,
+    ["microsoftupdate-updateids-tkyzhuuhy1kwn54k?skipbloom=1"] = discovered_updateids,
     ["urls-mkn69fkj7zufcejb"] = discovered_outlinks
   }) do
     print("queuing for", string.match(key, "^(.+)%-"))
