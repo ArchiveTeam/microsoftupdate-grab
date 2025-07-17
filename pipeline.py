@@ -21,10 +21,7 @@ import time
 import string
 import re
 
-if sys.version_info[0] < 3:
-    from urllib import unquote
-else:
-    from urllib.parse import unquote
+import urllib.parse
 
 import seesaw
 from seesaw.externalprocess import WgetDownload
@@ -79,7 +76,7 @@ if not WGET_AT:
 #
 # Update this each time you make a non-cosmetic change.
 # It will be added to the WARC files and reported to the tracker.
-VERSION = '20250717.03'
+VERSION = '20250717.04'
 USER_AGENT = 'Mozilla/5.0 (X11; Linux i686; rv:124.0) Gecko/20100101 Firefox/124.0'
 TRACKER_ID = 'microsoftupdate'
 TRACKER_HOST = 'legacy-api.arpa.li'
@@ -236,7 +233,7 @@ class MoveFiles(SimpleTask):
 
 def normalize_string(s):
     while True:
-        temp = unquote(s).strip().lower()
+        temp = urllib.parse.unquote(s).strip().lower()
         if temp == s:
             break
         s = temp
@@ -332,6 +329,7 @@ class WgetArgs(object):
         item['concurrency'] = str(concurrency)
 
         b32digests = {}
+        uuid_searches = {}
 
         for item_name in item['item_name'].split('\0'):
             wget_args.extend(['--warc-header', 'x-wget-at-project-item-name: '+item_name])
@@ -348,11 +346,23 @@ class WgetArgs(object):
                 if len(digest) > 0:
                     wget_args.extend(['--warc-header', 'microsoft-update-binary-base32digest: '+digest])
                 wget_args.append(url)
+            elif item_type in ('search', 'uuid-search'):
+                if item_type == 'uuid-search':
+                    uuid_string, search_string = item_value.split(':', 1)
+                    if len(search_string) > 0:
+                        search_string += ' '
+                    search_string += uuid_string + '*'
+                    uuid_searches[search_string] = uuid_string
+                else:
+                    search_string = item_value
+                wget_args.extend(['--warc-header', 'microsoft-update-search: '+search_string])
+                wget_args.append('https://www.catalog.update.microsoft.com/Search.aspx?q=' + urllib.parse.quote_plus(search_string))
             else:
                 raise Exception('Unknown item')
 
         item['item_name_newline'] = item['item_name'].replace('\0', '\n')
         item['b32digests'] = json.dumps(b32digests)
+        item['uuid_searches'] = json.dumps(uuid_searches)
 
         if 'bind_address' in globals():
             wget_args.extend(['--bind-address', globals()['bind_address']])
@@ -392,7 +402,8 @@ pipeline = Pipeline(
             'item_names': ItemValue('item_name_newline'),
             'warc_file_base': ItemValue('warc_file_base'),
             'concurrency': ItemValue('concurrency'),
-            'b32digests': ItemValue('b32digests')
+            'b32digests': ItemValue('b32digests'),
+            'uuid_searches': ItemValue('uuid_searches')
         }
     ),
     CheckIntegrity(),

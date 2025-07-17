@@ -27,10 +27,12 @@ local logged_response = false
 local discovered_outlinks = {}
 local discovered_items = {}
 local discovered_binaries = {}
+local discovered_updateids = {}
 local bad_items = {}
 local ids = {}
 
 local b32digests = cjson.decode(os.getenv("b32digests"))
+local uuid_searches = cjson.decode(os.getenv("uuid_searches"))
 
 local retry_url = false
 local is_initial_url = true
@@ -89,6 +91,7 @@ find_item = function(url)
   for pattern, name in pairs({
     ["^https?://www%.catalog%.update%.microsoft%.com/ScopedViewInline%.aspx%?updateid=([0-9a-f%-]+)$"]="id",
     ["^https?://catalog%.s%.download%.windowsupdate%.com/(.+)$"]="bin",
+    ["^https?://www%.catalog%.update%.microsoft%.com/Search%.aspx%?q=([^&]+)$"]="search"
   }) do
     value = string.match(url, pattern)
     type_ = name
@@ -134,6 +137,27 @@ set_item = function(url)
       if temp then
         new_item_value = temp
       end
+    elseif new_item_type == "search" then
+      newcontext["search_escaped"] = new_item_value
+      new_item_value = string.gsub(new_item_value, "%+", " ")
+      new_item_value = urlparse.unescape(new_item_value)
+      newcontext["search"] = new_item_value
+      local search_term, star_term = string.match(new_item_value, "^(.-)([0-9a-f]+)%*$")
+      if search_term == " " then
+        search_term = ""
+      end
+      newcontext["search_term"] = search_term
+      newcontext["star_term"] = star_term
+      if star_term then
+        star_term_check = uuid_searches[new_item_value]
+        if not star_term_check then
+          error("Expected a UUID search query.")
+        elseif star_term_check ~= star_term then
+          error("Inconsistent star terms found.")
+        end
+        new_item_type = "uuid-search"
+        new_item_value = star_term .. ":" .. search_term
+      end
     end
     local extra = ""
     if new_item_type == "bin" then
@@ -148,6 +172,10 @@ set_item = function(url)
       item_value = new_item_value
       item_type = new_item_type
       ids[string.lower(item_value)] = true
+      if context["search"] then
+        ids[string.lower(context["search"])] = true
+        ids[string.lower(context["search_escaped"])] = true
+      end
       abortgrab = false
       tries = 0
       retry_url = false
@@ -191,7 +219,8 @@ allowed = function(url, parenturl)
   end
 
   for _, pattern in pairs({
-    "([0-9a-f%-]+)"
+    "([0-9a-f%-]+)",
+    "([^%?=&;]+)"
   }) do
     for s in string.gmatch(url, pattern) do
       if ids[string.lower(s)] then
@@ -498,6 +527,31 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
         error("Did not find any download.")
       end
     end
+    if string.match(url, "/Search%.aspx%?q=") then
+      for updateid in string.gmatch(html, "goToDetails%(\"([0-9a-f%-]+)\"%);") do
+        discover_item(discovered_updateids, "id:" .. updateid)
+      end
+      if item_type == "uuid-search"
+        and (
+          string.match(html, " of 1000 ")
+          or string.match(html, "To narrow your search")
+          or string.match(html, "Only the first [0-9]+ are returned%.")
+        ) then
+        for char in string.gmatch("0123456789abcdef", "(.)") do
+          discover_item(discovered_items, item_type .. ":" .. context["star_term"] .. char .. ":" .. context["search_term"])
+        end
+      end
+      local pages = string.match(html, "%(page [0-9]+ of ([0-9]+)%)")
+      if pages then
+        pages = tonumber(pages)
+        if pages > 40 then
+          error("Did not expect more than 40 pages.")
+        end
+        for i = 0 , pages-1 do
+          check(set_new_params(url, {["p"]=tostring(i)}))
+        end
+      end
+    end
     for newurl in string.gmatch(string.gsub(html, "&[qQ][uU][oO][tT];", '"'), '([^"]+)') do
       checknewurl(newurl)
     end
@@ -673,6 +727,7 @@ wget.callbacks.finish = function(start_time, end_time, wall_time, numurls, total
   for key, data in pairs({
     ["microsoftupdate-0ht48j5nl9fbsyhs?skipbloom=1"] = discovered_items,
     ["microsoftupdate-binaries-r6n8hwu8ui3vx2lt?skipbloom=1"] = discovered_binaries,
+    ["microsoftupdate-updateids-?skipbloom=1"] = discovered_updateids,
     ["urls-mkn69fkj7zufcejb"] = discovered_outlinks
   }) do
     print("queuing for", string.match(key, "^(.+)%-"))
