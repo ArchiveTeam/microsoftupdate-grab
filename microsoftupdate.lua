@@ -539,7 +539,8 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
           string.match(html, " of 1000 ")
           or string.match(html, "To narrow your search")
           or string.match(html, "Only the first [0-9]+ are returned%.")
-        ) then
+        )
+        and string.len(context["star_term"]) < 6 then
         for char in string.gmatch("0123456789abcdef", "(.)") do
           discover_item(discovered_items, item_type .. ":" .. context["star_term"] .. char .. ":" .. context["search_term"])
         end
