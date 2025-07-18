@@ -525,8 +525,14 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
       end
     end
     if string.match(url, "/Search%.aspx%?q=") then
+      local found = 0
       for updateid in string.gmatch(html, "goToDetails%(\"([0-9a-f%-]+)\"%);") do
         discover_item(discovered_updateids, "id:" .. updateid)
+        found = found + 1
+      end
+      if found == 0
+        and not string.match(html, "We did not find") then
+        error("Found no IDs, but also not message saying there aren't any.")
       end
       if item_type == "uuid-search"
         and (
