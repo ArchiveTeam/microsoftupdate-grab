@@ -26,6 +26,7 @@ local logged_response = false
 
 local discovered_outlinks = {}
 local discovered_items = {}
+local discovered_items_unique = {}
 local discovered_binaries = {}
 local discovered_updateids = {}
 local bad_items = {}
@@ -142,7 +143,7 @@ set_item = function(url)
       new_item_value = string.gsub(new_item_value, "%+", " ")
       new_item_value = urlparse.unescape(new_item_value)
       newcontext["search"] = new_item_value
-      local search_term, star_term = string.match(new_item_value, "^(.-) *([0-9a-f]+)%*$")
+      local search_term, star_term = string.match(new_item_value, "^(.-) *([0-9a-f]*)%*$")
       newcontext["search_term"] = search_term
       newcontext["star_term"] = star_term
       if star_term then
@@ -730,8 +731,9 @@ wget.callbacks.finish = function(start_time, end_time, wall_time, numurls, total
   file:close()
   for key, data in pairs({
     ["microsoftupdate-0ht48j5nl9fbsyhs?skipbloom=1"] = discovered_items,
-    ["microsoftupdate-binaries-r6n8hwu8ui3vx2lt?skipbloom=1"] = discovered_binaries,
-    ["microsoftupdate-updateids-tkyzhuuhy1kwn54k?skipbloom=1"] = discovered_updateids,
+    --["microsoftupdate-0ht48j5nl9fbsyhs"] = discovered_items_unique,
+    ["microsoftupdate-stash-binaries-j1vid2nfyvyr87qn?skipbloom=1"] = discovered_binaries,
+    ["microsoftupdate-stash-updateids-79v5pmmyyrzolvjt?skipbloom=1"] = discovered_updateids,
     ["urls-mkn69fkj7zufcejb"] = discovered_outlinks
   }) do
     print("queuing for", string.match(key, "^(.+)%-"))
