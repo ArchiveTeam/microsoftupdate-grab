@@ -76,7 +76,7 @@ if not WGET_AT:
 #
 # Update this each time you make a non-cosmetic change.
 # It will be added to the WARC files and reported to the tracker.
-VERSION = '20260327.01'
+VERSION = '20260720.01'
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0'
 TRACKER_ID = 'microsoftupdate'
 TRACKER_HOST = 'legacy-api.arpa.li'
@@ -336,12 +336,24 @@ class WgetArgs(object):
             wget_args.append('item-name://'+item_name)
             item_type, item_value = item_name.split(':', 1)
             if item_type == 'id':
-                wget_args.extend(['--warc-header', 'microsoft-update-id: '+item_value])
-                wget_args.append('https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid='+item_value)
-            elif item_type == 'bin':
-                digest, path = item_value.split(':', 1)
-                b32digests[path] = digest
-                url = 'https://catalog.s.download.windowsupdate.com/' + path
+                update_id, separator, revision = item_value.partition(':')
+                wget_args.extend(['--warc-header', 'microsoft-update-id: '+update_id])
+                url = 'https://www.catalog.update.microsoft.com/ScopedViewRedirect.aspx?updateid='+update_id
+                if separator:
+                    wget_args.extend(['--warc-header', 'microsoft-update-revision: '+revision])
+                    url += '&revisionnumber='+revision
+                wget_args.append(url)
+            elif item_type == 'dlc':
+                wget_args.extend(['--warc-header', 'microsoft-update-download-center-id: '+item_value])
+                wget_args.append('https://www.microsoft.com/en-us/download/details.aspx?id='+item_value)
+            elif item_type in ('bin', 'binurl'):
+                digest, location = item_value.split(':', 1)
+                location = location.replace(' ', '%20')
+                b32digests[location] = digest
+                if item_type == 'binurl':
+                    url = location
+                else:
+                    url = 'https://catalog.s.download.windowsupdate.com/' + location
                 wget_args.extend(['--warc-header', 'microsoft-update-binary: '+url])
                 if len(digest) > 0:
                     wget_args.extend(['--warc-header', 'microsoft-update-binary-base32digest: '+digest])
@@ -443,3 +455,4 @@ pipeline = Pipeline(
         stats=ItemValue('stats')
     )
 )
+

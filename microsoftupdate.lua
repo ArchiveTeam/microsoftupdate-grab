@@ -6,10 +6,17 @@ local utf8 = require("utf8")
 local html_entities = require("htmlEntities")
 local base64 = require("base64")
 local basexx = require("basexx")
+local iconv = require("iconv")
+local openssl_digest = require("openssl.digest")
+local uuid = require("uuid")
+
+math.randomseed(os.time())
+uuid.set_rng(uuid.rng.math_random())
 
 local item_dir = os.getenv("item_dir")
 local warc_file_base = os.getenv("warc_file_base")
 local concurrency = tonumber(os.getenv("concurrency"))
+
 local item_type = nil
 local item_name = nil
 local item_value = nil
@@ -26,9 +33,10 @@ local logged_response = false
 
 local discovered_outlinks = {}
 local discovered_items = {}
-local discovered_items_unique = {}
 local discovered_binaries = {}
 local discovered_updateids = {}
+local discovered_classifications = {}
+local discovered_periodic = {}
 local bad_items = {}
 local ids = {}
 
@@ -87,11 +95,22 @@ find_item = function(url)
   if ids[url] then
     return nil
   end
-  local value = nil
+  local value, revision = string.match(url, "^https?://www%.catalog%.update%.microsoft%.com/ScopedViewRedirect%.aspx%?updateid=([0-9a-f%-]+)&revisionnumber=([0-9]+)$")
+  if value then
+    return {
+      ["value"]=value,
+      ["type"]="id",
+      ["revision"]=revision
+    }
+  end
   local type_ = nil
   for pattern, name in pairs({
     ["^https?://www%.catalog%.update%.microsoft%.com/ScopedViewInline%.aspx%?updateid=([0-9a-f%-]+)$"]="id",
+    ["^https?://www%.catalog%.update%.microsoft%.com/ScopedViewRedirect%.aspx%?updateid=([0-9a-f%-]+)$"]="id",
     ["^https?://catalog%.s%.download%.windowsupdate%.com/(.+)$"]="bin",
+    ["^(https?://download%.microsoft%.com/.+)$"]="binurl",
+    ["^(https?://catalog%.sf%.dl%.delivery%.mp%.microsoft%.com/.+)$"]="binurl",
+    ["^https?://www%.microsoft%.com/[0-9a-z%-]+/download/details%.aspx%?id=([0-9]+)$"]="dlc",
     ["^https?://www%.catalog%.update%.microsoft%.com/Search%.aspx%?q=([^&]+)$"]="search"
   }) do
     value = string.match(url, pattern)
@@ -108,20 +127,48 @@ find_item = function(url)
   end
 end
 
+is_binary_item = function(type_)
+  return type_ == "bin" or type_ == "binurl"
+end
+
 finish_item = function()
-  if item_type ~= "bin" then
+  if item_type == "id" then
+    if abortgrab then
+      return true
+    end
+    for digest in pairs(context["encrypted"]) do
+      if not context["decryption"][digest] then
+        error("Did not finish the decryption check.")
+      end
+    end
+    if context["metadata_seen"]
+      and not context["revision_item"]
+      and context["revision_checks"] ~= math.max(3, math.floor(tonumber(context["revision"]) / 100) + 1) then
+      error("Did not finish the revision check.")
+    end
+    if not context["download_found"]
+      and not context["metadata_seen"]
+      and not context["driver_set_seen"] then
+      error("Did not finish the catalog or metadata check.")
+    end
+    return true
+  elseif item_type == "dlc" then
+    if not abortgrab and not context["download_found"] then
+      error("Did not find a DLC download.")
+    end
+    return true
+  elseif not is_binary_item(item_type) then
     return true
   end
   local count = 0
-  for url, matches in pairs(context["matches"]) do
-    if matches ~= 404 then
-      if not matches then
-        error("Incorrect matching SHA1 found.")
-      end
+  for _, matches in pairs(context["matches"]) do
+    if matches == false then
+      error("Incorrect matching SHA1 found.")
+    elseif matches == true then
       count = count + 1
     end
   end
-  if count ~= 1 then
+  if count < 1 then
     error("Incorrect number of matching URLs found.")
   end
   return true
@@ -130,7 +177,14 @@ end
 set_item = function(url)
   found = find_item(url)
   if found then
-    local newcontext = {["matches"]={}}
+    local newcontext = {
+      ["decryption"]={},
+      ["encrypted"]={},
+      ["matches"]={},
+      ["retried"]={},
+      ["revision_checks"]=0,
+      ["todo_binaries"]={}
+    }
     new_item_type = found["type"]
     new_item_value = found["value"]
     if new_item_type == "bin" then
@@ -157,12 +211,20 @@ set_item = function(url)
         new_item_value = star_term .. ":" .. search_term
       end
     end
+    if found["revision"] then
+      newcontext["revision_item"] = true
+      newcontext["revision"] = found["revision"]
+      discover_item(discovered_updateids, "id:" .. new_item_value)
+    end
     local extra = ""
-    if new_item_type == "bin" then
+    if is_binary_item(new_item_type) then
       local b32digest = b32digests[new_item_value]
       extra = b32digest .. ":"
     end
     new_item_name = new_item_type .. ":" .. extra .. new_item_value
+    if newcontext["revision_item"] then
+      new_item_name = new_item_name .. ":" .. newcontext["revision"]
+    end
     if new_item_name ~= item_name then
       finish_item()
       ids = {}
@@ -184,18 +246,6 @@ set_item = function(url)
   end
 end
 
-percent_encode_url = function(url)
-  temp = ""
-  for c in string.gmatch(url, "(.)") do
-    local b = string.byte(c)
-    if b < 32 or b > 126 then
-      c = string.format("%%%02X", b)
-    end
-    temp = temp .. c
-  end
-  return temp
-end
-
 allowed = function(url, parenturl)
   local noscheme = string.match(url, "^https?://(.*)$")
 
@@ -206,8 +256,26 @@ allowed = function(url, parenturl)
 
   if ids[string.match(url, "^https?://[^/]+/(.*)$")]
     or ids[string.match(url, "^https?://[^/]+/[^/]+/(.*)$")]
-    or (item_type == "id" and string.match(url, "/DownloadDialog%.aspx")) then
+    or (
+      item_type == "id"
+      and (
+        string.match(url, "/DownloadDialog%.aspx")
+        or string.match(url, "^https://sws%.update%.microsoft%.com/[^/]+/[^/]+%.asmx$")
+        or string.match(url, "^https://sws%.update%.microsoft%.com/[^/]+/[^/]+%.asmx%?op=[0-9a-zA-Z]+[&]?.*$")
+        or string.match(url, "^https://www%.microsoft%.com/en%-us/wdsi/definitions/antimalware%-definition%-release%-notes%?requestVersion=[0-9]+%.[0-9]+%.[0-9]+%.[0-9]+$")
+      )
+    )
+    or (
+      item_type == "dlc"
+      and string.match(url, "^https?://www%.microsoft%.com/[0-9a-z%-]+/download/details%.aspx%?id=" .. item_value .. "$")
+    ) then
     return true
+  end
+
+  if item_type == "dlc"
+    and string.match(url, "^https?://download%.microsoft%.com/.+$") then
+    discover_item(discovered_binaries, "binurl::" .. percent_encode_url(string.gsub(url, "^http://", "https://")))
+    return false
   end
 
   if not string.match(url, "^https?://[^/]*update%.microsoft%.com/")
@@ -217,7 +285,7 @@ allowed = function(url, parenturl)
   end
 
   for _, pattern in pairs({
-    "([0-9a-f%-]+)",
+    "([0-9a-fA-F%-]+)",
     "([^%?=&;]+)"
   }) do
     for s in string.gmatch(url, pattern) do
@@ -260,7 +328,7 @@ percent_encode_url = function(newurl)
     newurl, "(.)",
     function (s)
       local b = string.byte(s)
-      if b < 32 or b > 126 then
+      if b <= 32 or b > 126 then
         return string.format("%%%02X", b)
       end
       return s
@@ -275,6 +343,10 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
   local json = nil
 
   local post_data = nil
+  local soap_action = nil
+  local software_distribution = "http://www.microsoft.com/SoftwareDistribution"
+  local server_sync_url = "https://sws.update.microsoft.com/ServerSyncWebService/ServerSyncWebService.asmx"
+  local protocol_version = "1.21"
 
   downloaded[url] = true
 
@@ -315,7 +387,8 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
     while string.find(url_, "&amp;") do
       url_ = string.gsub(url_, "&amp;", "&")
     end
-    if not processed(url_ .. tostring(post_data))
+    local request_id = url_ .. (post_data or "")
+    if not processed(request_id)
       and allowed(url_, origurl) then
       local headers = {}
       if string.match(url_, "/DownloadDialog%.aspx") then
@@ -323,6 +396,15 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
           return nil
         end
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        table.insert(urls, {
+          url=url_,
+          headers=headers,
+          body_data=post_data,
+          method="POST"
+        })
+      elseif soap_action then
+        headers["Content-Type"] = "text/xml; charset=utf-8"
+        headers["SOAPAction"] = "\"" .. soap_action .. "\""
         table.insert(urls, {
           url=url_,
           headers=headers,
@@ -337,7 +419,7 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
           headers=headers
         })
       end
-      addedtolist[url_.. tostring(post_data)] = true
+      addedtolist[request_id] = true
       addedtolist[url] = true
     end
   end
@@ -438,52 +520,146 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
     local count = 0
     for _ in pairs(data) do
       count = count + 1
-    end 
+    end
     return count
   end
 
-  if item_type == "bin" then
-    if status_code == 200 then
-      local domains = {
-        "https://catalog.s.download.windowsupdate.com/",
-        "http://download.windowsupdate.com/",
-        "http://b1.download.windowsupdate.com/"
-      }
-      for _, domain in pairs(domains) do
-        if string.match(url, "^(https?://[^/]+/)") == domain then
-          for _, domain2 in pairs(domains) do
-            check(domain2 .. item_value)
-         end
-       end
-     end
+  local function check_soap(newurl, action, data, params, params_only)
+    soap_action = action
+    post_data = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+      .. "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+        .. "<soap:Body>" .. data .. "</soap:Body>"
+      .. "</soap:Envelope>"
+    local query_url = newurl .. "?op=" .. string.match(action, "([^/]+)$")
+    if not params_only then
+      check(newurl)
+      if not params then
+        check(query_url)
+      end
     end
-    for _, path in pairs({"/", "/c/", "/d/"}) do
-      check(urlparse.absolute(url, path .. item_value))
+    if type(params) == "string" then
+      params = {params}
+    end
+    if params then
+      for _, value in ipairs(params) do
+        check(query_url .. "&" .. value)
+      end
+    end
+    post_data = nil
+    soap_action = nil
+  end
+
+  local function update_identity(revision)
+    return "<UpdateIdentity>"
+        .. "<UpdateID>" .. item_value .. "</UpdateID>"
+        .. "<RevisionNumber>" .. revision .. "</RevisionNumber>"
+      .. "</UpdateIdentity>"
+  end
+
+  local function discover_binary(digest, newurl)
+    if item_type == "id"
+      and context["encrypted"]
+      and context["encrypted"][digest]
+      and not context["decryption"][digest] then
+      context["todo_binaries"][digest .. ":" .. newurl] = {digest, newurl}
+      return
+    end
+    local b32digest = ""
+    if digest then
+      b32digest = basexx.to_base32(base64.decode(digest))
+    end
+    newurl = string.gsub(newurl, "^(https?://)www%.", "%1")
+    local domain, path = string.match(newurl, "^https?://([^/]+)/(.+)$")
+    if domain == "catalog.sf.dl.delivery.mp.microsoft.com"
+      or domain == "download.microsoft.com" then
+      discover_item(discovered_binaries, "binurl:" .. b32digest .. ":" .. percent_encode_url(string.gsub(newurl, "^http://", "https://")))
+    elseif domain == "catalog.s.download.windowsupdate.com"
+      or domain == "download.windowsupdate.com"
+      or domain == "b1.download.windowsupdate.com"
+      or domain == "au.download.windowsupdate.com"
+      or domain == "au.b1.download.windowsupdate.com" then
+      path = string.match(path, "^[cd]/(.+)$") or path
+      discover_item(discovered_binaries, "bin:" .. b32digest .. ":" .. path)
+    else
+      error("Found unexpected address " .. domain .. ".")
+    end
+    context["download_found"] = true
+  end
+
+  if item_type == "bin" then
+    for _, domain in pairs({
+      "https://catalog.s.download.windowsupdate.com/",
+      "http://download.windowsupdate.com/",
+      "http://b1.download.windowsupdate.com/",
+      "http://au.download.windowsupdate.com/",
+      "http://au.b1.download.windowsupdate.com/"
+    }) do
+      for _, path in pairs({"", "c/", "d/"}) do
+        check(domain .. path .. item_value)
+      end
     end
   end
 
   if allowed(url)
-    and status_code < 300
-    and item_type ~= "bin" then
+    and (
+      status_code < 300
+      or (
+        status_code == 500
+        and string.match(url, "[%?&]revisionstart=[0-9]+&revisionend=[0-9]+")
+      )
+    )
+    and not is_binary_item(item_type) then
     html = read_file(file)
+    if string.match(url, "^https://www%.microsoft%.com/en%-us/wdsi/definitions/antimalware%-definition%-release%-notes%?requestVersion=") then
+      local requested = string.match(url, "requestVersion=([0-9]+%.[0-9]+%.[0-9]+%.[0-9]+)$")
+      local returned = string.match(html, "<snap id=\"titleVersion\">([0-9]+%.[0-9]+%.[0-9]+%.[0-9]+)</snap>")
+      if returned ~= requested then
+        error("Response has wrong version " .. tostring(returned) .. " for " .. requested .. ".")
+      end
+      return urls
+    end
+    if string.match(url, "/ScopedViewRedirect%.aspx%?updateid=") then
+      check_soap(
+        server_sync_url,
+        software_distribution .. "/GetAuthConfig",
+        "<GetAuthConfig xmlns=\"" .. software_distribution .. "\" />"
+      )
+    end
     if string.match(url, "/ScopedViewInline%.aspx%?updateid=") then
-      post_data = 
-        "updateIDs=%5B%7B%22size%22%3A0%2C%22languages%22%3A%22%22%2C%22uidInfo%22%3A%22" .. item_value .. "%22%2C%22updateID%22%3A%22" .. item_value .. "%22%7D%5D"
-        .. "&updateIDsBlockedForImport=&wsusApiPresent=&contentImport=&sku=&serverName=&ssl=&portNumber=&version="
-      for _, params in pairs({"", "?updateid=" .. item_value, "?scopedview=true"}) do
+      post_data = "updateIDs=%5B%7B%22size%22%3A0%2C%22languages%22%3A%22%22%2C%22uidInfo%22%3A%22" .. item_value .. "%22%2C%22updateID%22%3A%22" .. item_value .. "%22%7D%5D"
+        .. "&updateIDsBlockedForImport="
+        .. "&wsusApiPresent="
+        .. "&contentImport="
+        .. "&sku="
+        .. "&serverName="
+        .. "&ssl="
+        .. "&portNumber="
+        .. "&version="
+      for _, params in pairs({
+        "",
+        "?updateid=" .. item_value,
+        "?scopedview=true",
+        "?updateid=" .. item_value .. "&scopedview=true"
+      }) do
         check("https://www.catalog.update.microsoft.com/DownloadDialog.aspx" .. params)
       end
       post_data = nil
-      check("https://www.catalog.update.microsoft.com/ScopedView.aspx?updateid=" .. item_value)
+      for _, endpoint in pairs({
+        "ViewBasket.aspx?updateids=",
+        "ScopedView.aspx?updateid=",
+        "ScopedViewBasic.aspx?updateid=",
+        "ScopedViewGeneric.aspx?updateid="
+      }) do
+        check("https://www.catalog.update.microsoft.com/" .. endpoint .. item_value)
+      end
     end
     if string.match(url, "/DownloadDialog%.aspx") then
-      local found = false
       for download_information in string.gmatch(html, "downloadInformation%[([0-9]+)%]%s*=") do
         if download_information ~= "0" then
-          error("Unexpected download_information ID " .. download_information .. ".")
+          error("Unexpected downloadInformation ID " .. download_information .. ".")
         end
         local base_s = "downloadInformation%[" .. download_information .. "%]%.files%["
-        local max_num = 0
+        local max_num = -1
         local count = 0
         local files = {}
         for files_id in string.gmatch(html, base_s .. "([0-9]+)%]%s*=") do
@@ -503,26 +679,461 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
           count = count + 1
         end
         if max_num + 1 ~= count then
-          error("Count incorrect file count.")
+          error("Got incorrect file count.")
         end
         for _, file_data in pairs(files) do
-          local b32digest = basexx.to_base32(base64.decode(file_data["digest"]))
-          local domain, path = string.match(file_data["url"], "^https?://([^/]+)/(.+)$")
-          if domain ~= "catalog.s.download.windowsupdate.com"
-            and domain ~= "download.windowsupdate.com" then
-            error("Found unexpected address " .. domain .. ".")
-          end
-          local temp = string.match(path, "^[cd]/(.+)$")
-          if temp then
-            path = temp
-          end
-          local new_item = "bin:" .. b32digest .. ":" .. path
-          discover_item(discovered_binaries, new_item)
-          found = true
+          discover_binary(file_data["digest"], file_data["url"])
         end
+      end
+    end
+    if string.match(url, "^https://sws%.update%.microsoft%.com/") then
+      local revision_start, revision_end = string.match(url, "[%?&]revisionstart=([0-9]+)&revisionend=([0-9]+)")
+      if revision_start then
+        revision_start = tonumber(revision_start)
+        revision_end = tonumber(revision_end)
+        local revisions = {}
+        local expected = revision_end - revision_start + 1
+        local requested = expected
+        local returned = expected
+        local removed = 0
+        for revision = revision_start, revision_end do
+          revisions[revision] = true
+        end
+        if status_code == 500 then
+          local message = html_entities.decode(string.match(html, "<Message>(.-)</Message>"))
+          local missing = nil
+          requested, returned, removed, missing = string.match(
+            message,
+            "Requested ([0-9]+) returned ([0-9]+) %(test content removed: ([0-9]+)%)%. Missing Revisions: (.+)"
+          )
+          requested = tonumber(requested)
+          returned = tonumber(returned)
+          removed = tonumber(removed)
+          for updateid, revision in string.gmatch(missing, "([0-9a-fA-F%-]+)%.([0-9]+)") do
+            if string.lower(updateid) == item_value then
+              revisions[tonumber(revision)] = false
+            end
+          end
+        end
+        local count = 0
+        for revision = revision_start, revision_end do
+          if revisions[revision] then
+            count = count + 1
+          end
+        end
+        if requested ~= expected
+          or returned ~= count
+          or removed ~= 0 then
+          error("Incorrect revision check response.")
+        end
+        for revision = revision_start, revision_end do
+          if revisions[revision] then
+            discover_item(discovered_updateids, "id:" .. item_value .. ":" .. revision)
+          end
+        end
+        context["revision_checks"] = context["revision_checks"] + 1
+        return urls
+      elseif string.match(url, "[%?&]op=") then
+        return urls
+      end
+      html = string.gsub(
+        html,
+        "<[0-9a-zA-Z_%-]*:?XmlUpdateBlobCompressed>(.-)</[0-9a-zA-Z_%-]*:?XmlUpdateBlobCompressed>",
+        function(compressed)
+          local filename = item_dir .. "/" .. warc_file_base .. "_metadata.cab"
+          local file = assert(io.open(filename, "wb"))
+          file:write(base64.decode(compressed))
+          file:close()
+          local process = assert(io.popen("cabextract -q -p " .. filename))
+          local metadata = process:read("*all")
+          local success = process:close()
+          os.remove(filename)
+          if not success or string.len(metadata) == 0 then
+            error("Could not decompress XmlUpdateBlob.")
+          end
+          if string.byte(metadata, 2) == 0 and string.byte(metadata, 4) == 0 then
+            metadata = assert(iconv.new("UTF-8", "UTF-16LE"):iconv(metadata))
+          end
+          for _, escape in ipairs({
+            {"&", "&amp;"},
+            {"<", "&lt;"},
+            {">", "&gt;"}
+          }) do
+            metadata = string.gsub(metadata, escape[1], escape[2])
+          end
+          return "<XmlUpdateBlob>" .. metadata .. "</XmlUpdateBlob>"
+        end
+      )
+      if string.match(html, "<GetAuthConfigResponse") then
+        local dss_auth = software_distribution .. "/Server/DssAuthWebService"
+        check_soap(
+          "https://sws.update.microsoft.com/DssAuthWebService/DssAuthWebService.asmx",
+          dss_auth .. "/GetAuthorizationCookie",
+          "<GetAuthorizationCookie xmlns=\"" .. dss_auth .. "\">"
+            .. "<accountName>wsus.contoso.com</accountName>"
+            .. "<accountGuid>" .. uuid() .. "</accountGuid>"
+          .. "</GetAuthorizationCookie>"
+        )
+      elseif string.match(html, "<GetAuthorizationCookieResponse") then
+        local plugin_id = html_entities.decode(string.match(html, "<PlugInId>(.-)</PlugInId>"))
+        local cookie_data = html_entities.decode(string.match(html, "<CookieData>(.-)</CookieData>"))
+        check_soap(
+          server_sync_url,
+          software_distribution .. "/GetCookie",
+          "<GetCookie xmlns=\"" .. software_distribution .. "\">"
+            .. "<authCookies>"
+              .. "<AuthorizationCookie>"
+                .. "<PlugInId>" .. plugin_id .. "</PlugInId>"
+                .. "<CookieData>" .. cookie_data .. "</CookieData>"
+              .. "</AuthorizationCookie>"
+            .. "</authCookies>"
+            .. "<protocolVersion>" .. protocol_version .. "</protocolVersion>"
+          .. "</GetCookie>"
+        )
+      elseif string.match(html, "<GetCookieResponse") then
+        local expiration = html_entities.decode(string.match(html, "<Expiration>(.-)</Expiration>"))
+        local encrypted_data = html_entities.decode(string.match(html, "<EncryptedData>(.-)</EncryptedData>"))
+        context["wsus_cookie"] = "<cookie>"
+            .. "<Expiration>" .. expiration .. "</Expiration>"
+            .. "<EncryptedData>" .. encrypted_data .. "</EncryptedData>"
+          .. "</cookie>"
+        check_soap(
+          server_sync_url,
+          software_distribution .. "/GetConfigData",
+          "<GetConfigData xmlns=\"" .. software_distribution .. "\">"
+            .. context["wsus_cookie"]
+          .. "</GetConfigData>"
+        )
+      elseif string.match(html, "<GetConfigDataResponse") then
+        if string.match(html, "<ProtocolVersion>(.-)</ProtocolVersion>") ~= protocol_version then
+          error("Found higher protocol version.")
+        end
+        check_soap(
+          server_sync_url,
+          software_distribution .. "/GetRelatedRevisionsForUpdates",
+          "<GetRelatedRevisionsForUpdates xmlns=\"" .. software_distribution .. "\">"
+            .. context["wsus_cookie"]
+            .. "<updateIDs>"
+              .. "<guid>" .. item_value .. "</guid>"
+            .. "</updateIDs>"
+          .. "</GetRelatedRevisionsForUpdates>",
+          "updateid=" .. item_value
+        )
+      elseif string.match(html, "<GetRelatedRevisionsForUpdatesResponse") then
+        for updateid, revision in string.gmatch(
+          html,
+          "<UpdateIdentity>%s*"
+            .. "<UpdateID>([0-9a-fA-F%-]+)</UpdateID>%s*"
+            .. "<RevisionNumber>([0-9]+)</RevisionNumber>%s*"
+          .. "</UpdateIdentity>"
+        ) do
+          updateid = string.lower(updateid)
+          if updateid == item_value then
+            if not context["revision_item"] then
+              context["revision"] = revision
+              discover_item(discovered_updateids, "id:" .. updateid .. ":" .. revision)
+            end
+          elseif string.match(updateid, "^[0-9a-f%-]+$") then
+            discover_item(discovered_updateids, "id:" .. updateid)
+            discover_item(discovered_updateids, "id:" .. updateid .. ":" .. revision)
+          end
+        end
+        if context["revision"] then
+          check_soap(
+            server_sync_url,
+            software_distribution .. "/GetUpdateData",
+            "<GetUpdateData xmlns=\"" .. software_distribution .. "\">"
+              .. context["wsus_cookie"]
+              .. "<updateIds>" .. update_identity(context["revision"]) .. "</updateIds>"
+            .. "</GetUpdateData>",
+            {
+              "updateid=" .. item_value .. "&revisionnumber=" .. context["revision"],
+              "updateid=" .. item_value
+            }
+          )
+        else
+          check_soap(
+            server_sync_url,
+            software_distribution .. "/GetDriverSetData",
+            "<GetDriverSetData xmlns=\"" .. software_distribution .. "\">"
+              .. context["wsus_cookie"]
+              .. "<driverSets>"
+                .. "<guid>" .. item_value .. "</guid>"
+              .. "</driverSets>"
+            .. "</GetDriverSetData>",
+            "driversetid=" .. item_value
+          )
+        end
+      elseif string.match(html, "<GetDriverSetDataResponse") then
+        for data in string.gmatch(html, "<ServerSyncDriverSetData>(.-)</ServerSyncDriverSetData>") do
+          local driver_set_id = string.lower(html_entities.decode(string.match(data, "<DriverSetId>(.-)</DriverSetId>")))
+          if driver_set_id ~= item_value then
+            error("Found unexpected driver set.")
+          end
+          context["driver_set_seen"] = true
+          local driver_set = html_entities.decode(string.match(data, "<DriverSetXml>(.-)</DriverSetXml>"))
+          for _, pattern in ipairs({
+            "UpdateID%s*=%s*\"([0-9a-fA-F%-]+)\"",
+            "<UpdateID>%s*([0-9a-fA-F%-]+)%s*</UpdateID>"
+          }) do
+            for updateid in string.gmatch(driver_set, pattern) do
+              discover_item(discovered_updateids, "id:" .. string.lower(updateid))
+            end
+          end
+        end
+        if not context["driver_set_seen"] and not context["download_found"] then
+          abort_item()
+        end
+      elseif string.match(html, "<GetUpdateDataResponse") then
+        local is_product = false
+        local metadata_has_files = false
+        local secured = false
+        for data in string.gmatch(html, "<ServerSyncUpdateData>(.-)</ServerSyncUpdateData>") do
+          local updateid, revision = string.match(
+            data,
+            "<Id>%s*"
+              .. "<UpdateID>([0-9a-fA-F%-]+)</UpdateID>%s*"
+              .. "<RevisionNumber>([0-9]+)</RevisionNumber>%s*"
+            .. "</Id>"
+          )
+          if updateid then
+            updateid = string.lower(updateid)
+          end
+          if updateid == item_value
+            and revision == context["revision"] then
+            context["metadata_seen"] = true
+            metadata_has_files = string.match(data, "<FileDigestList>") ~= nil
+            local decoded = html_entities.decode(data)
+            local bundle = string.gsub(
+              updateid,
+              "^([0-9]+%-[0-9]+)%-[0-9]+%-00[36][24]%-([0-9]+)[0-9][0-9]$",
+              "%1-0001-0000-%200"
+            )
+            if bundle ~= updateid then
+              discover_item(discovered_updateids, "id:" .. bundle)
+              discover_item(discovered_updateids, "id:" .. bundle .. ":" .. revision)
+            end
+            local definition_version = string.match(decoded, "Microsoft Endpoint Protection %- KB2461484.-([0-9]+%.[0-9]+%.[0-9]+%.[0-9]+)")
+            if definition_version then
+              check("https://www.microsoft.com/en-us/wdsi/definitions/antimalware-definition-release-notes?requestVersion=" .. definition_version)
+            end
+            if string.match(decoded, "UpdateType%s*=%s*\"Category\"") then
+              local category_type = string.match(decoded, "CategoryType%s*=%s*\"([a-zA-Z]+)\"")
+              if category_type == "Product" then
+                is_product = true
+              end
+              if category_type == "Product"
+                or category_type == "ProductFamily"
+                or category_type == "UpdateClassification"
+                or category_type == "Company" then
+                discover_item(discovered_periodic, "id:" .. updateid)
+              end
+              if category_type == "UpdateClassification" then
+                discover_item(discovered_classifications, "id:" .. updateid)
+              end
+            end
+            secured = string.match(decoded, "SecuredFragment%s*=%s*\"FileDecryption\"") ~= nil
+              or string.match(decoded, "<[0-9a-zA-Z_%-]*:?SecuredFragment>%s*FileDecryption%s*</[0-9a-zA-Z_%-]*:?SecuredFragment>") ~= nil
+            for attributes in string.gmatch(decoded, "<[0-9a-zA-Z_%-]*:?File%s+([^>]+)>") do
+              if string.match(attributes, "IsEncrypted%s*=%s*\"true\"") then
+                local digest = string.match(attributes, "Digest%s*=%s*\"([^\"]+)\"")
+                if not digest then
+                  error("Did not find digest for encrypted file.")
+                end
+                context["encrypted"][digest] = true
+              end
+            end
+            for related in string.gmatch(decoded, "UpdateID%s*=%s*\"([0-9a-fA-F%-]+)\"") do
+              related = string.lower(related)
+              if related ~= item_value then
+                discover_item(discovered_updateids, "id:" .. related)
+              end
+            end
+          elseif updateid then
+            discover_item(discovered_updateids, "id:" .. updateid)
+            discover_item(discovered_updateids, "id:" .. updateid .. ":" .. revision)
+          end
+        end
+        if not context["metadata_seen"] then
+          error("Did not find expected metadata.")
+        end
+        if secured and get_count(context["encrypted"]) == 0 then
+          error("Did not find encrypted files.")
+        end
+        local metadata_url_found = false
+        for data in string.gmatch(html, "<ServerSyncUrlData>(.-)</ServerSyncUrlData>") do
+          local newurl = string.match(data, "<MUUrl>(.-)</MUUrl>")
+          if newurl then
+            local digest = html_entities.decode(string.match(data, "<FileDigest>(.-)</FileDigest>"))
+            metadata_url_found = true
+            discover_binary(digest, html_entities.decode(newurl))
+          end
+        end
+        if metadata_has_files and not metadata_url_found then
+          error("Did not find a metadata file download.")
+        end
+        if not context["revision_item"] then
+          local revision = tonumber(context["revision"])
+          for revision_start = 0, math.max(200, math.floor(revision / 100) * 100), 100 do
+            local revision_end = revision_start + 99
+            if revision_start == 0 then
+              revision_start = 1
+            end
+            local update_ids = ""
+            for value = revision_start, revision_end do
+              update_ids = update_ids .. update_identity(value)
+            end
+            check_soap(
+              server_sync_url,
+              software_distribution .. "/GetUpdateData",
+              "<GetUpdateData xmlns=\"" .. software_distribution .. "\">"
+                .. context["wsus_cookie"]
+                .. "<updateIds>" .. update_ids .. "</updateIds>"
+              .. "</GetUpdateData>",
+              "updateid=" .. item_value .. "&revisionstart=" .. revision_start .. "&revisionend=" .. revision_end,
+              true
+            )
+          end
+        end
+        if get_count(context["encrypted"]) > 0 then
+          check_soap(
+            server_sync_url,
+            software_distribution .. "/GetUpdateDecryptionData",
+            "<GetUpdateDecryptionData xmlns=\"" .. software_distribution .. "\">"
+              .. context["wsus_cookie"]
+              .. "<updateIds>" .. update_identity(context["revision"]) .. "</updateIds>"
+            .. "</GetUpdateDecryptionData>",
+            {
+              "updateid=" .. item_value .. "&revisionnumber=" .. context["revision"],
+              "updateid=" .. item_value
+            }
+          )
+        end
+        if is_product then
+          local classifications = ""
+          for _, classification in ipairs({
+            "0fa1201d-4330-4fa8-8ae9-b877473b6441", -- Security Updates
+            "28bc880e-0592-4cbf-8f95-c79b17911d5f", -- Update Rollups
+            "3689bdc8-b205-4af4-8d4a-a63924c5e9d5", -- Upgrades
+            "68c5b0a3-d1a6-4553-ae49-01d3a7827828", -- Service Packs
+            "b4832bd8-e735-4761-8daf-37f882276dab", -- Tools
+            "b54e7d24-7add-428f-8b75-90a396fa584f", -- Feature Packs
+            "cd5ffd1e-e932-4e3a-bf74-18bf0b1bbd83", -- Updates
+            "e0789628-ce08-4437-be74-2495b842f43b", -- Definition Updates
+            "e6cf1350-c01b-414d-a61f-263d14d133b4", -- Critical Updates
+            "ebfc1fc5-71a4-4f7b-9aca-3b9a503104a0", -- Drivers
+            "5c9376ab-8ce6-464a-b136-22113dd69801", -- Applications (old)
+            "434de588-ed14-48f5-8eed-a15e09a991f6", -- Connectors (old)
+            "e140075d-8433-45c3-ad87-e72345b36078", -- Developer Kits (old)
+            "9511d615-35b2-47bb-927f-f73d8e9260bb" -- Guidance (old)
+          }) do
+            classifications = classifications
+              .. "<IdAndDelta>"
+                .. "<Id>" .. classification .. "</Id>"
+                .. "<Delta>false</Delta>"
+              .. "</IdAndDelta>"
+          end
+          check_soap(
+            server_sync_url,
+            software_distribution .. "/GetRevisionIdList",
+            "<GetRevisionIdList xmlns=\"" .. software_distribution .. "\">"
+              .. context["wsus_cookie"]
+              .. "<filter>"
+                .. "<GetConfig>false</GetConfig>"
+                .. "<Get63LanguageOnly>false</Get63LanguageOnly>"
+                .. "<Categories>"
+                  .. "<IdAndDelta>"
+                    .. "<Id>" .. item_value .. "</Id>"
+                    .. "<Delta>false</Delta>"
+                  .. "</IdAndDelta>"
+                .. "</Categories>"
+                .. "<Classifications>" .. classifications .. "</Classifications>"
+              .. "</filter>"
+            .. "</GetRevisionIdList>",
+            "categoryid=" .. item_value
+          )
+        end
+        local inline_url = "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=" .. item_value
+        ids[inline_url] = true
+        check(inline_url)
+      elseif string.match(html, "<GetRevisionIdListResponse") then
+        for updateid, revision in string.gmatch(
+          html,
+          "<UpdateIdentity>%s*"
+            .. "<UpdateID>([0-9a-fA-F%-]+)</UpdateID>%s*"
+            .. "<RevisionNumber>([0-9]+)</RevisionNumber>%s*"
+          .. "</UpdateIdentity>"
+        ) do
+          updateid = string.lower(updateid)
+          discover_item(discovered_updateids, "id:" .. updateid)
+          discover_item(discovered_updateids, "id:" .. updateid .. ":" .. revision)
+        end
+      elseif string.match(html, "<GetUpdateDecryptionDataResponse") then
+        local updateid, revision = string.match(
+          html,
+          "<UpdateId>%s*"
+            .. "<UpdateID>([0-9a-fA-F%-]+)</UpdateID>%s*"
+            .. "<RevisionNumber>([0-9]+)</RevisionNumber>%s*"
+          .. "</UpdateId>"
+        )
+        if not updateid
+          or string.lower(updateid) ~= item_value
+          or revision ~= context["revision"] then
+          error("Did not find expected decryption data.")
+        end
+        for data in string.gmatch(html, "<ServerSyncFileDecryption>(.-)</ServerSyncFileDecryption>") do
+          local key = string.match(data, "<DecryptionKey>(.-)</DecryptionKey>")
+          if key then
+            if string.len(key) % 4 ~= 0
+              or not string.match(key, "^[0-9a-zA-Z+/]+=?=?$") then
+              error("Found invalid decryption key.")
+            end
+            local digest = html_entities.decode(string.match(data, "<FileDigest>(.-)</FileDigest>"))
+            context["decryption"][digest] = true
+          end
+        end
+        local missing = false
+        for digest in pairs(context["encrypted"]) do
+          if not context["decryption"][digest] then
+            error("Did not find all decryption keys.")
+          end
+        end
+        for _, binary in pairs(context["todo_binaries"]) do
+          discover_binary(binary[1], binary[2])
+        end
+        context["todo_binaries"] = {}
+      else
+        error("Unexpected response.")
+      end
+      return urls
+    end
+    if item_type == "id" then
+      for updateid in string.gmatch(html, "ScopedView[a-zA-Z]*%.aspx%?updateid=([0-9a-fA-F%-]+)") do
+        updateid = string.lower(updateid)
+        if updateid ~= item_value then
+          discover_item(discovered_updateids, "id:" .. updateid)
+        end
+      end
+    end
+    if string.match(url, "^https?://www%.microsoft%.com/[0-9a-z%-]+/download/details%.aspx%?id=") then
+      json = string.match(html, "window%.__DLCDetails__=(.-)</script>")
+      if not json then
+        error("Did not find DLC details.")
+      end
+      local details = cjson.decode(json)["dlcDetailsView"]
+      if details["detailsId"] ~= item_value then
+        error("Found incorrect DLC ID.")
+      end
+      local found = false
+      for _, file_data in pairs(details["downloadFile"]) do
+        discover_binary(nil, file_data["url"])
+        found = true
       end
       if not found then
         error("Did not find any download.")
+      end
+      for _, locale in pairs(details["localeDropdown"]) do
+        check("https://www.microsoft.com/" .. locale["cultureCode"] .. "/download/details.aspx?id=" .. item_value)
       end
     end
     if string.match(url, "/Search%.aspx%?q=") then
@@ -552,12 +1163,12 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
         if pages > 40 then
           error("Did not expect more than 40 pages.")
         end
-        for i = 0 , pages-1 do
+        for i = 0, pages - 1 do
           check(set_new_params(url, {["p"]=tostring(i)}))
         end
       end
     end
-    for newurl in string.gmatch(string.gsub(html, "&[qQ][uU][oO][tT];", '"'), '([^"]+)') do
+    for newurl in string.gmatch(string.gsub(html, "&quot;", "\""), "([^\"]+)") do
       checknewurl(newurl)
     end
     for newurl in string.gmatch(string.gsub(html, "&#039;", "'"), "([^']+)") do
@@ -566,7 +1177,7 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
     for newurl in string.gmatch(html, "[^%-]href='([^']+)'") do
       checknewshorturl(newurl)
     end
-    for newurl in string.gmatch(html, '[^%-]href="([^"]+)"') do
+    for newurl in string.gmatch(html, "[^%-]href=\"([^\"]+)\"") do
       checknewshorturl(newurl)
     end
     for newurl in string.gmatch(html, ":%s*url%(([^%)]+)%)") do
@@ -583,8 +1194,12 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
 end
 
 wget.callbacks.dedup_response = function(url, digest)
-  if item_type == "bin" then
-    local matching = digest == "sha1:" .. b32digests[item_value]
+  if is_binary_item(item_type) then
+    local b32digest = b32digests[item_value]
+    if b32digest == "" then
+      b32digest = context["digest"]
+    end
+    local matching = digest == "sha1:" .. b32digest
     if context["matches"][url] == 404 then
       matching = nil
     end
@@ -603,23 +1218,86 @@ wget.callbacks.write_to_warc = function(url, http_stat)
     error("No item name found.")
   end
   is_initial_url = false
-  if item_type == "bin"
+  if is_binary_item(item_type)
     and http_stat["statcode"] == 404 then
     context["matches"][url["url"]] = 404
   end
+  if http_stat["statcode"] == 404
+    and item_type == "id"
+    and string.match(url["url"], "[%?&]revisionstart=[0-9]+&revisionend=[0-9]+") then
+    retry_url = true
+    return false
+  end
   if http_stat["statcode"] ~= 200
-    and http_stat["statcode"] ~= 404 then
+    and http_stat["statcode"] ~= 404
+    and not (
+      item_type == "id"
+      and (
+        (
+          http_stat["statcode"] == 500
+          and string.match(url["url"], "[%?&]revisionstart=[0-9]+&revisionend=[0-9]+")
+        )
+        or (
+          http_stat["statcode"] == 302
+          and context["metadata_seen"]
+          and (
+            string.match(url["url"], "/ScopedView[A-Za-z]*%.aspx%?updateid=")
+            or string.match(url["url"], "/DownloadDialog%.aspx")
+          )
+        )
+      )
+    ) then
     retry_url = true
     return false
   end
   if http_stat["len"] == 0
-    and http_stat["statcode"] < 300 then
+    and http_stat["statcode"] < 300
+    and not string.match(url["url"], "/ScopedViewRedirect%.aspx%?updateid=") then
     retry_url = true
     return false
   end
   if abortgrab then
     print("Not writing to WARC.")
     return false
+  end
+  if is_binary_item(item_type)
+    and http_stat["statcode"] == 200 then
+    local digest = openssl_digest.new("sha1")
+    local file = assert(io.open(http_stat["local_file"], "rb"))
+    while true do
+      local data = file:read(1024 * 1024)
+      if not data then
+        break
+      end
+      digest:update(data)
+    end
+    file:close()
+    local b32digest = basexx.to_base32(digest:final())
+    local expected_digest = b32digests[item_value]
+    if expected_digest == "" and context["digest_checked"] then
+      expected_digest = context["digest"]
+    end
+    if expected_digest == "" then
+      if not context["digest"] then
+        context["digest"] = b32digest
+        retry_url = true
+        return false
+      elseif context["digest"] ~= b32digest then
+        error("Second download did not match previous digest.")
+      end
+      context["digest_checked"] = true
+      context["matches"][url["url"]] = true
+    else
+      local matching = b32digest == expected_digest
+      context["matches"][url["url"]] = matching
+      if not matching then
+        if not context["retried"][url["url"]] then
+          context["retried"][url["url"]] = true
+          retry_url = true
+          return false
+        end
+      end
+    end
   end
   retry_url = false
   tries = 0
@@ -655,8 +1333,9 @@ wget.callbacks.httploop_result = function(url, err, http_stat)
     io.stdout:flush()
     tries = tries + 1
     local maxtries = 11
-    if status_code == 401 or status_code == 403
-      or (status_code == 302 and string.match(url["url"], "/ScopedViewInline%.aspx%?updateid=")) then
+    if status_code == 302
+      or status_code == 401
+      or status_code == 403 then
       tries = maxtries + 1
     end
     if tries > maxtries then
@@ -729,11 +1408,13 @@ wget.callbacks.finish = function(start_time, end_time, wall_time, numurls, total
     file:write(url .. "\n")
   end
   file:close()
+
   for key, data in pairs({
     ["microsoftupdate-0ht48j5nl9fbsyhs?skipbloom=1"] = discovered_items,
-    --["microsoftupdate-0ht48j5nl9fbsyhs"] = discovered_items_unique,
     ["microsoftupdate-stash-binaries-j1vid2nfyvyr87qn?skipbloom=1"] = discovered_binaries,
     ["microsoftupdate-stash-updateids-79v5pmmyyrzolvjt?skipbloom=1"] = discovered_updateids,
+    ["microsoftupdate-stash-classifications-h7g4q3w9x2n8c6vk?skipbloom=1"] = discovered_classifications,
+    ["microsoftupdate-stash-periodic-3fdbcc9ad6b4efa0?skipbloom=1"] = discovered_periodic,
     ["urls-mkn69fkj7zufcejb"] = discovered_outlinks
   }) do
     print("queuing for", string.match(key, "^(.+)%-"))
@@ -768,5 +1449,4 @@ wget.callbacks.before_exit = function(exit_status, exit_status_string)
   end
   return exit_status
 end
-
 
